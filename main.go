@@ -1,9 +1,5 @@
 package main
 
-/* TODO: Instead of checking two levels. Add completed domains to a threadsafe queue, and read from there
-If NoError && ! CNAME then add to queue
-
-*/
 import (
 	"context"
 	"flag"
@@ -15,7 +11,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/miekg/dns"
 	"github.com/sheerun/queue"
 	"golang.org/x/sync/semaphore"
 )
@@ -26,9 +21,6 @@ const noFlag = "MISSING_FLAG"
 
 var stringDelims = []string{"", "0", "1", "2", "3", "-", "_"}
 var ctx = context.Background()
-
-var config, _ = dns.ClientConfigFromFile("/etc/resolv.conf")
-var client = new(dns.Client)
 
 func readFile(file string) string {
 	b, err := ioutil.ReadFile(file)
@@ -50,19 +42,8 @@ func getTextRecord(domain string) string {
 	}
 }
 
-func noError(domain string) bool {
-	m := new(dns.Msg)
-	m.SetQuestion(dns.Fqdn(domain), dns.TypeCNAME)
-	r, _, _ := client.Exchange(m, net.JoinHostPort(config.Servers[0], config.Port))
-	if r == nil {
-		return false
-	}
-	return strings.Contains(r.String(), "NOERROR")
-}
-
 // first check dns then http
-func check(domain string, saveDirectory string) bool {
-	cname, cnameErr := net.LookupCNAME(domain)
+func check(domain string, saveDirectory string) {
 	ips, err := net.LookupIP(domain)
 	if err == nil {
 		resp, err := http.Get("http://" + domain)
@@ -76,7 +57,7 @@ func check(domain string, saveDirectory string) bool {
 			if err != nil {
 				fmt.Println("Tried to write file but received err", err)
 			}
-			fmt.Println("Found:", resp.Status, ips, domain, "cname="+cname)
+			fmt.Println("Found:", resp.Status, ips, domain)
 		} else {
 			fmt.Println("DNS ONLY:", domain, err)
 			err := ioutil.WriteFile(filepath.Join(saveDirectory, domain), []byte(err.Error()), 0644)
@@ -93,14 +74,6 @@ func check(domain string, saveDirectory string) bool {
 		}
 	}
 
-	return (cnameErr == nil && cname == domain+".") || noError(domain)
-}
-
-func appendSubdomainToQueue(words *queue.Queue, subdomain string, originalWordlist []string) {
-	fmt.Println("Searching deaper for subdomain", subdomain)
-	for _, word := range originalWordlist {
-		words.Append(word + "." + subdomain)
-	}
 }
 
 // Checks if either queue is non empty,
@@ -135,9 +108,7 @@ func runPermutations(words *queue.Queue, domain string, saveDirectory string, se
 		}
 
 		go func() {
-			if check(subdomain, saveDirectory) {
-				appendSubdomainToQueue(words, word, originalWordlist)
-			}
+			check(subdomain, saveDirectory)
 			sem.Release(1)
 		}()
 	}
@@ -145,10 +116,9 @@ func runPermutations(words *queue.Queue, domain string, saveDirectory string, se
 }
 
 func generatePermutations(wordlist []string) []string {
-	var perms []string
+	var perms = wordlist
 	for _, delim := range stringDelims {
-		for _, word := range append([]string{""}, wordlist...) {
-			// Prepend "" to the word list so that we test all subdomains on their own before trying any perms
+		for _, word := range wordlist {
 			for _, subWord := range wordlist {
 				perms = append(perms, subWord+delim+word)
 			}
@@ -160,17 +130,19 @@ func generatePermutations(wordlist []string) []string {
 func runSpammer(worldlistFile string, domain string, saveDirectory string) {
 	wordlist := generatePermutations(strings.Split(readFile(worldlistFile), "\n"))
 	fmt.Println("Generated", len(wordlist), "permutations")
+
 	wordQueue := queue.New()
 	for _, word := range wordlist {
 		// Add all words to the queue in reverse order
-
+		// This preserves the order of the words in the file
 		wordQueue.Append(word)
 	}
 
 	var sem = semaphore.NewWeighted(int64(noThreads))
 	runPermutations(wordQueue, domain, saveDirectory, sem, wordlist)
+
+	// Acquire all locks (wait for all threads completed) before continuing
 	fmt.Println("Waiting for threads to finish up...")
-	// Acquire all locks (all threads completed) before continuing
 	sem.Acquire(ctx, int64(noThreads))
 }
 
